@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""magpie_crew.py — Magpie 路由组查询、派工检查与改组的辅助脚本。
+"""magpie_crew.py — inspect Magpie routing groups, dispatch checks, and group edits.
 
-只读命令: status, groups, show, picker, models, judge
-调用模型: ask <model>（纯文本）、run <model>（Claude Code CLI，能读写文件）
-改路由组: group add|set|rm|restore|pick|copy|template|auto|rule (rm 需要 --yes)
-配置:     config [set key value]
+Read-only commands: status, groups, show, picker, models, judge
+Model calls:        ask <model> (plain text), run <model> (Claude Code CLI, file access)
+Group edits:        group add|set|rm|restore|pick|copy|template|auto|rule (rm needs --yes)
+Config:             config [set key value]
 """
 
 from __future__ import annotations
@@ -31,8 +31,8 @@ DEFAULT_CONFIG = {
     "judge_model": "auto/glm-5.3-flash",
     "judge_effort": "high",
     "max_dispatch": 4,
-    # Claude 桌面端给模型起的内部 id（mythos-magpie-<n>）；顺序与模型列表里的
-    # routing group 顺序一致。为空时说明还没校准。
+    # Internal model ids used by the Claude desktop app (mythos-magpie-<n>);
+    # their order matches the routing groups in the model list. Empty = not calibrated.
     "app_model_ids": [],
     "app_model_order": [],
 }
@@ -107,21 +107,21 @@ def http_json(method: str, path: str, payload: dict | None = None,
         body = exc.read().decode("utf-8", "replace")[:600]
         raise RuntimeError(f"HTTP {exc.code}: {body}") from exc
     except urllib.error.URLError as exc:
-        raise RuntimeError(f"连不上 magpie ({BASE_URL}): {exc.reason}") from exc
+        raise RuntimeError(f"cannot reach magpie ({BASE_URL}): {exc.reason}") from exc
 
 
 def run_cli(args: list[str], timeout: int = 40) -> str:
     if not os.path.exists(MAGPIE_BIN):
-        raise RuntimeError(f"找不到 magpie CLI: {MAGPIE_BIN}")
+        raise RuntimeError(f"magpie CLI not found: {MAGPIE_BIN}")
     try:
         proc = subprocess.run([MAGPIE_BIN, *args], capture_output=True,
                               text=True, timeout=timeout)
     except subprocess.TimeoutExpired as exc:
-        raise RuntimeError(f"magpie {' '.join(args)} 超时") from exc
+        raise RuntimeError(f"magpie {' '.join(args)} timed out") from exc
     out = (proc.stdout or "").rstrip("\n")
     err = (proc.stderr or "").strip()
     if proc.returncode != 0:
-        raise RuntimeError(err or out or f"magpie 退出码 {proc.returncode}")
+        raise RuntimeError(err or out or f"magpie exited with {proc.returncode}")
     return out
 
 
@@ -157,7 +157,7 @@ def strip_suffix(model: str) -> str:
 
 
 def picker_groups(options: list[dict]) -> list[dict]:
-    """模型列表里的 routing group 条目，保持顺序（桌面端内部 id 也按这个顺序）。"""
+    """Routing-group entries in the model list, in order (desktop ids follow this order)."""
     return [o for o in options
             if "routing group" in (o.get("label") or "").lower()
             or "routing group" in (o.get("description") or "").lower()]
@@ -239,7 +239,7 @@ def build_groups() -> dict:
         if mi is None and not gid.startswith("group/"):
             mi = model_map.get("group/" + gid)
         if mi is None:
-            # 自定义组：/v1/models 可能还没有它，按名字兜底
+            # Custom group: /v1/models may not list it yet; fall back to the name
             for cand in models:
                 label = (cand.get("magpie_label") or "")
                 if label.endswith("routing group") and cand.get("display_name") == entry["name"]:
@@ -295,16 +295,16 @@ def fmt_ctx(n) -> str:
 def print_groups(data: dict) -> None:
     groups = data["groups"]
     if not groups:
-        print("没有查到路由组。先运行 magpie status 确认网关在跑。")
+        print("No routing groups found. Run `magpie status` to confirm the gateway is up.")
         return
-    header = ("组", "路由", "上下文", "思考档位", "派工模型")
+    header = ("group", "routing", "context", "effort", "dispatch model")
     rows = []
     for g in groups:
         levels = "/".join(g["levels"]) if g["levels"] else "—"
         rows.append((
             g["id"], g["routing"], fmt_ctx(g["context"]), levels,
             g["app_model"] or g["picker_model"]
-            or ("（picker 里没有）" if not g["in_picker"] else "—"),
+            or ("(not in picker)" if not g["in_picker"] else "—"),
         ))
     widths = [max(disp_width(r[i]) for r in [header, *rows]) for i in range(5)]
     print("  ".join(pad(h, widths[i]) for i, h in enumerate(header)))
@@ -314,32 +314,33 @@ def print_groups(data: dict) -> None:
         if g["members"]:
             print("    └ " + " · ".join(g["members"]))
     ready = sum(1 for g in groups if g["in_picker"])
-    print(f"\n共 {len(groups)} 组，其中 {ready} 组在 Claude Code 的模型列表里可直接派工；"
-          f"magpie 共 {data['models_count']} 个模型。")
+    print(f"\n{len(groups)} groups; {ready} are in Claude Code's model list and can be dispatched;"
+          f" magpie has {data['models_count']} models.")
     if any(g["app_model"] for g in groups):
-        print("带 mythos- 的是本机 Claude 桌面端的内部模型 id，"
-              "直接给 start_session / set_session_model 用。")
+        print("The mythos- ids are the local Claude desktop internal model ids;"
+              " pass them to start_session / set_session_model.")
 
 
 def print_status(data: dict, cfg: dict) -> None:
     groups = data["groups"]
     ready = sum(1 for g in groups if g["in_picker"])
-    print(f"magpie   {data['magpie']}  ·  {data['models_count']} 个模型，可用")
-    print(f"CLI      {MAGPIE_BIN}  ·  {'OK' if os.path.exists(MAGPIE_BIN) else '缺失'}")
-    print(f"路由组   {len(groups)} 组，其中 {ready} 组可直接派工")
-    print(f"picker   {data['picker_count']} 个可选模型（~/.claude/settings.json）")
+    print(f"magpie   {data['magpie']}  ·  {data['models_count']} models available")
+    print(f"CLI      {MAGPIE_BIN}  ·  {'OK' if os.path.exists(MAGPIE_BIN) else 'missing'}")
+    print(f"groups   {len(groups)} total, {ready} ready to dispatch")
+    print(f"picker   {data['picker_count']} selectable models (~/.claude/settings.json)")
     print(f"judge    {cfg['judge_model']} / effort={cfg['judge_effort']}")
     print(f"config   {CONFIG_PATH}")
     mapped = sum(1 for g in groups if g["app_model"])
-    print(f"app 模型 {mapped}/{len(groups)} 组已映射（Claude 桌面端内部 id）")
+    print(f"app ids  {mapped}/{len(groups)} groups mapped (Claude desktop internal ids)")
     options, _ = read_picker()
     order_now = [strip_suffix(o["model"]) for o in picker_groups(options)]
     saved = cfg.get("app_model_order") or []
     if saved and saved != order_now:
-        print("提示     模型列表顺序变了，app 映射可能过期；重新跑 app-models 校准")
+        print("warning  the model list order changed; app mapping may be stale; re-run app-models")
     missing = [g["id"] for g in groups if not g["in_picker"]]
     if missing:
-        print("提示     这些组不在 picker 里，派工前先确认：" + ", ".join(missing))
+        print("warning  these groups are not in the picker; check before dispatching: "
+              + ", ".join(missing))
 
 
 # ---------------------------------------------------------------- commands
@@ -362,7 +363,7 @@ def cmd_groups(args) -> int:
 def cmd_picker(args) -> int:
     options, _ = read_picker()
     if not options:
-        print("读不到 ~/.claude/settings.json 的 modelPicker。")
+        print("Could not read modelPicker from ~/.claude/settings.json.")
         return 1
     needle = (args.grep or "").lower()
     for opt in options:
@@ -378,12 +379,12 @@ def cmd_show(args) -> int:
     data = build_groups()
     g = next((x for x in data["groups"] if x["id"] == args.id), None)
     if g:
-        print("\n派工信息：")
-        print(f"  picker 模型   {g['picker_model'] or '（没有，需要同步）'}")
-        print(f"  app 模型      {g['app_model'] or '（未校准）'}")
-        print(f"  上下文        {fmt_ctx(g['context'])}")
-        print(f"  思考档位      {', '.join(g['levels']) or '—'}")
-        print(f"  输入模态      {', '.join(g['modalities']) or '—'}")
+        print("\nDispatch info:")
+        print(f"  picker model  {g['picker_model'] or '(missing; needs sync)'}")
+        print(f"  app model     {g['app_model'] or '(not calibrated)'}")
+        print(f"  context       {fmt_ctx(g['context'])}")
+        print(f"  effort        {', '.join(g['levels']) or '—'}")
+        print(f"  input         {', '.join(g['modalities']) or '—'}")
     return 0
 
 
@@ -394,24 +395,24 @@ def cmd_app_models(argv: list[str]) -> int:
     order = [strip_suffix(o["model"]) for o in pgs]
     if argv and argv[0] == "set":
         if len(argv) < 2:
-            print("用法：app-models set <id1,id2,...>", file=sys.stderr)
+            print("usage: app-models set <id1,id2,...>", file=sys.stderr)
             return 2
         ids = [x.strip().replace("mythos-magpie-", "")
                for x in argv[1].split(",") if x.strip()]
         if len(ids) != len(order):
-            print(f"id 数量 {len(ids)} 和模型列表里的 routing group 数量 "
-                  f"{len(order)} 对不上，没有保存。", file=sys.stderr)
+            print(f"got {len(ids)} ids but the model list has {len(order)} routing groups; "
+                  f"nothing saved.", file=sys.stderr)
             return 2
         cfg["app_model_ids"] = ids
         cfg["app_model_order"] = order
         save_config(cfg)
-        print(f"已保存 {len(ids)} 个 app 模型 id。")
+        print(f"Saved {len(ids)} app model ids.")
     ids = cfg.get("app_model_ids") or []
     if not ids:
-        print("还没校准 Claude 桌面端的内部模型 id。\n"
-              "校准方法：对一个空闲会话调用 set_session_model，传一个不存在的模型，"
-              "错误信息会按模型列表顺序列出 mythos-magpie-*；把它们逗号分隔传给 "
-              "`app-models set`。")
+        print("Claude desktop internal model ids are not calibrated yet.\n"
+              "To calibrate: call set_session_model on an idle session with a nonexistent "
+              "model; the error lists every mythos-magpie-* in model-list order. Pass the "
+              "numeric parts, comma-separated, to `app-models set`.")
         return 0
     for i, gid in enumerate(order):
         base = ids[i] if i < len(ids) else "—"
@@ -440,7 +441,7 @@ def cmd_judge(args) -> int:
     cfg = load_config()
     task = args.task.strip()
     if not task:
-        print("缺少 --task", file=sys.stderr)
+        print("missing --task", file=sys.stderr)
         return 2
     model = args.model or cfg["judge_model"]
     data = build_groups()
@@ -457,24 +458,24 @@ def cmd_judge(args) -> int:
             "input": g["modalities"],
         })
     prompt = (
-        "你是多模型派工裁判，只输出 JSON，不要解释。\n"
-        f"任务：{task}\n"
-        f"当前主管模型：{args.current_model or '未知'}\n"
-        "候选路由组（JSON）：\n"
+        "You are a multi-model dispatch judge. Output JSON only, no explanation.\n"
+        f"Task: {task}\n"
+        f"Current supervisor model: {args.current_model or 'unknown'}\n"
+        "Candidate routing groups (JSON):\n"
         + json.dumps(candidates, ensure_ascii=False)
-        + "\n判断两件事："
-        "1) 当前主管模型是否足以胜任这个任务（信息不足时倾向 stay）；"
-        "2) 若不足，选一个候选组当新主管；"
-        "3) 不管 verdict 是 stay 还是 switch，都给出最多 4 个子任务的拆分，"
-        "每个子任务给出 group 和 effort（必须是该组 efforts 里有的档位）。\n"
-        "输出字段：verdict（stay|switch）、supervisor_group（组 id 或 null）、"
-        "confidence（0-1）、reasons（中文一句话）、"
-        "split（[{subtask, group, effort}]）。"
+        + "\nDecide three things:"
+        "1) whether the current supervisor can handle this task (lean stay when information is thin);"
+        "2) if not, pick one candidate group as the new supervisor;"
+        "3) regardless of stay or switch, propose a split of at most 4 sub-tasks,"
+        "each with a group and an effort level (must be one of that group's efforts).\n"
+        "Output fields: verdict (stay|switch), supervisor_group (group id or null),"
+        "confidence (0-1), reasons (one sentence),"
+        "split ([{subtask, group, effort}])."
     )
     payload = {
         "model": model,
         "messages": [
-            {"role": "system", "content": "你只输出一个 JSON 对象。"},
+            {"role": "system", "content": "Output a single JSON object."},
             {"role": "user", "content": prompt},
         ],
         "temperature": 0.2,
@@ -491,7 +492,7 @@ def cmd_judge(args) -> int:
             payload.pop("reasoning_effort", None)
             resp = http_json("POST", "/chat/completions", payload, timeout=150)
     except RuntimeError as exc:
-        print(f"裁判调用失败：{exc}", file=sys.stderr)
+        print(f"judge call failed: {exc}", file=sys.stderr)
         return 1
 
     content = ((resp.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
@@ -510,12 +511,12 @@ def cmd_judge(args) -> int:
 
 
 def cmd_ask(args) -> int:
-    """直接调用一个模型（路由组 id 或具体模型 id），只返回文本。"""
+    """Call one model directly (group id or concrete model id); return text only."""
     prompt = (args.prompt or "").strip()
     if not prompt and not sys.stdin.isatty():
         prompt = sys.stdin.read().strip()
     if not prompt:
-        print("缺少 --prompt（或从 stdin 传入提示词）", file=sys.stderr)
+        print("missing --prompt (or pipe the prompt via stdin)", file=sys.stderr)
         return 2
     parts = [prompt]
     for path in args.file or []:
@@ -523,12 +524,12 @@ def cmd_ask(args) -> int:
             with open(path, encoding="utf-8") as fh:
                 text = fh.read()
         except OSError as exc:
-            print(f"读不到文件 {path}: {exc}", file=sys.stderr)
+            print(f"cannot read file {path}: {exc}", file=sys.stderr)
             return 2
         if len(text) > 200_000:
-            print(f"文件太大（>200KB），先摘要或分段：{path}", file=sys.stderr)
+            print(f"file too large (>200KB); summarize or split it first: {path}", file=sys.stderr)
             return 2
-        parts.append(f"\n\n--- 文件：{path} ---\n{text}")
+        parts.append(f"\n\n--- file: {path} ---\n{text}")
     messages = []
     if args.system:
         messages.append({"role": "system", "content": args.system})
@@ -550,7 +551,7 @@ def cmd_ask(args) -> int:
             payload.pop("reasoning_effort", None)
             resp = http_json("POST", "/chat/completions", payload, timeout=args.timeout)
     except RuntimeError as exc:
-        print(f"模型调用失败：{exc}", file=sys.stderr)
+        print(f"model call failed: {exc}", file=sys.stderr)
         return 1
     content = ((resp.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
     if args.json:
@@ -563,7 +564,7 @@ def cmd_ask(args) -> int:
 
 
 def claude_cli_env() -> dict:
-    """让 claude CLI 走 magpie：补上 base url 和 token，不打印任何凭证。"""
+    """Point the claude CLI at magpie: fill in the base URL and token; never print them."""
     env = dict(os.environ)
     try:
         with open(CLAUDE_SETTINGS, encoding="utf-8") as fh:
@@ -580,20 +581,20 @@ def claude_cli_env() -> dict:
 
 
 def cmd_run(args) -> int:
-    """用 Claude Code CLI 跑一个直连模型：能读写文件、跑命令。"""
+    """Run a direct model through the Claude Code CLI: file access and commands."""
     prompt = (args.prompt or "").strip()
     if not prompt and not sys.stdin.isatty():
         prompt = sys.stdin.read().strip()
     if not prompt:
-        print("缺少 --prompt（或从 stdin 传入提示词）", file=sys.stderr)
+        print("missing --prompt (or pipe the prompt via stdin)", file=sys.stderr)
         return 2
     cli = os.environ.get("CLAUDE_CLI") or shutil.which("claude")
     if not cli:
-        print("找不到 claude CLI；可用 CLAUDE_CLI=/path/to/claude 指定", file=sys.stderr)
+        print("claude CLI not found; set CLAUDE_CLI=/path/to/claude", file=sys.stderr)
         return 2
     cwd = os.path.abspath(os.path.expanduser(args.cwd or os.getcwd()))
     if not os.path.isdir(cwd):
-        print(f"工作目录不存在：{cwd}", file=sys.stderr)
+        print(f"working directory does not exist: {cwd}", file=sys.stderr)
         return 2
     cmd = [cli, "-p", prompt, "--model", args.model,
            "--permission-mode", args.permission_mode]
@@ -608,7 +609,7 @@ def cmd_run(args) -> int:
         proc = subprocess.run(cmd, cwd=cwd, env=claude_cli_env(),
                               capture_output=True, text=True, timeout=args.timeout)
     except subprocess.TimeoutExpired:
-        print(f"超时（{args.timeout}s），CLI 已终止", file=sys.stderr)
+        print(f"timed out after {args.timeout}s; CLI terminated", file=sys.stderr)
         return 124
     out = (proc.stdout or "").rstrip()
     if out:
@@ -622,7 +623,7 @@ def cmd_run(args) -> int:
 
 def cmd_group(argv: list[str]) -> int:
     if not argv:
-        print("用法：group add|set|show|rm|restore|pick|copy|template|auto|rule ...",
+        print("usage: group add|set|show|rm|restore|pick|copy|template|auto|rule ...",
               file=sys.stderr)
         return 2
     action, rest = argv[0], argv[1:]
@@ -637,31 +638,32 @@ def cmd_group(argv: list[str]) -> int:
                 continue
             key = token.split("=", 1)[0]
             if key not in GROUP_KEYS:
-                print(f"不认识的字段 {key!r}；可用：" + ", ".join(sorted(GROUP_KEYS)),
+                print(f"unknown field {key!r}; available: " + ", ".join(sorted(GROUP_KEYS)),
                       file=sys.stderr)
                 return 2
     if action == "rm" and not yes:
-        print("删除路由组需要用户明确确认；确认后加 --yes。", file=sys.stderr)
+        print("Deleting a routing group requires explicit confirmation; add --yes once confirmed.",
+              file=sys.stderr)
         return 2
     if action == "show":
         cmd = [MAGPIE_BIN, "group", "show", *rest]
     else:
         cmd = [MAGPIE_BIN, "group", action, *rest]
     if dry:
-        print("将执行：" + " ".join(shlex.quote(x) for x in cmd))
+        print("would run: " + " ".join(shlex.quote(x) for x in cmd))
         return 0
     try:
         out = run_cli(cmd[1:], timeout=60)
     except RuntimeError as exc:
-        print(f"改组失败：{exc}", file=sys.stderr)
+        print(f"group edit failed: {exc}", file=sys.stderr)
         return 1
     if out:
         print(out)
     target = rest[0] if rest else ""
     if target:
-        print(f"\n验证：python3 {os.path.abspath(__file__)} show {target}")
-    print("提醒：改组后跑一次 groups，确认新组已出现在 picker；"
-          "没出现就重启 magpie（或让用户重新选一次模型）。")
+        print(f"\nverify: python3 {os.path.abspath(__file__)} show {target}")
+    print("Note: after editing, run groups and confirm the new group appears in the picker; "
+          "if not, restart magpie (or have the user select the model again).")
     return 0
 
 
@@ -673,7 +675,7 @@ def cmd_config(argv: list[str]) -> int:
     if argv[0] == "set" and len(argv) == 3:
         key, value = argv[1], argv[2]
         if key not in DEFAULT_CONFIG:
-            print(f"未知配置项 {key}；可用：" + ", ".join(DEFAULT_CONFIG), file=sys.stderr)
+            print(f"unknown config key {key}; available: " + ", ".join(DEFAULT_CONFIG), file=sys.stderr)
             return 2
         default = DEFAULT_CONFIG[key]
         if isinstance(default, bool):
@@ -685,7 +687,7 @@ def cmd_config(argv: list[str]) -> int:
         save_config(cfg)
         print(f"{key} = {cfg[key]}")
         return 0
-    print("用法：config | config set <key> <value>", file=sys.stderr)
+    print("usage: config | config set <key> <value>", file=sys.stderr)
     return 2
 
 
@@ -695,56 +697,56 @@ def main() -> int:
     if len(sys.argv) >= 2 and sys.argv[1] == "group":
         return cmd_group(sys.argv[2:])
 
-    parser = argparse.ArgumentParser(description="Magpie 路由组派工助手")
+    parser = argparse.ArgumentParser(description="Magpie routing-group dispatch helper")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    sub.add_parser("status", help="检查 magpie 网关、CLI、picker 与裁判配置")
+    sub.add_parser("status", help="check the magpie gateway, CLI, picker, and judge config")
 
-    p_groups = sub.add_parser("groups", help="列出所有路由组及其派工信息")
+    p_groups = sub.add_parser("groups", help="list routing groups and dispatch info")
     p_groups.add_argument("--json", action="store_true")
 
-    p_show = sub.add_parser("show", help="查看一个路由组")
+    p_show = sub.add_parser("show", help="show one routing group")
     p_show.add_argument("id")
 
-    p_picker = sub.add_parser("picker", help="列出 Claude Code 模型列表里的模型")
+    p_picker = sub.add_parser("picker", help="list models in Claude Code's model list")
     p_picker.add_argument("--grep")
 
-    p_models = sub.add_parser("models", help="列出 magpie 的模型")
+    p_models = sub.add_parser("models", help="list magpie models")
     p_models.add_argument("--groups-only", action="store_true")
     p_models.add_argument("--grep")
 
-    p_app = sub.add_parser("app-models", help="查看/校准 Claude 桌面端内部模型 id")
+    p_app = sub.add_parser("app-models", help="show/calibrate Claude desktop internal model ids")
     p_app.add_argument("args", nargs="*")
 
-    p_judge = sub.add_parser("judge", help="让裁判模型判断主管是否合适、如何拆任务")
+    p_judge = sub.add_parser("judge", help="ask the judge whether the supervisor fits and how to split")
     p_judge.add_argument("--task", required=True)
     p_judge.add_argument("--current-model")
-    p_judge.add_argument("--model", help="覆盖裁判模型")
+    p_judge.add_argument("--model", help="override the judge model")
 
-    p_ask = sub.add_parser("ask", help="直接调用任意模型（路由组或具体模型 id），只返回文本")
-    p_ask.add_argument("model", help="如 auto/gmodel 或 gemini-2/gemini-3.1-pro")
+    p_ask = sub.add_parser("ask", help="call any model directly (group or concrete id), text only")
+    p_ask.add_argument("model", help="e.g. auto/gmodel or gemini-2/gemini-3.1-pro")
     p_ask.add_argument("--prompt")
     p_ask.add_argument("--system")
-    p_ask.add_argument("--file", action="append", default=[], help="附带文本文件，可重复")
+    p_ask.add_argument("--file", action="append", default=[], help="attach a text file; repeatable")
     p_ask.add_argument("--max-tokens", type=int, default=2000)
     p_ask.add_argument("--temperature", type=float, default=0.6)
-    p_ask.add_argument("--effort", help="reasoning_effort；不支持时会自动去掉重试")
+    p_ask.add_argument("--effort", help="reasoning_effort; retried without it if unsupported")
     p_ask.add_argument("--timeout", type=int, default=180)
     p_ask.add_argument("--json", action="store_true")
 
-    p_run = sub.add_parser("run", help="用 Claude Code CLI 跑直连模型（能读写文件、跑命令）")
-    p_run.add_argument("model", help="如 gemini-2/gemini-3.1-pro")
+    p_run = sub.add_parser("run", help="run a direct model via Claude Code CLI (files and commands)")
+    p_run.add_argument("model", help="e.g. gemini-2/gemini-3.1-pro")
     p_run.add_argument("--prompt")
-    p_run.add_argument("--cwd", help="工作目录，默认当前目录")
+    p_run.add_argument("--cwd", help="working directory; defaults to the current directory")
     p_run.add_argument("--permission-mode", default="acceptEdits",
                        choices=["default", "acceptEdits", "plan", "bypassPermissions"])
     p_run.add_argument("--max-turns", type=int, default=40)
     p_run.add_argument("--timeout", type=int, default=900)
     p_run.add_argument("--json", dest="output_json", action="store_true",
-                       help="输出 CLI 的 JSON 结果")
+                       help="print the CLI's JSON result")
     p_run.add_argument("--dry-run", action="store_true")
 
-    sub.add_parser("config", help="查看或修改本技能配置").add_argument(
+    sub.add_parser("config", help="show or edit this skill's config").add_argument(
         "config_args", nargs="*")
 
     args = parser.parse_args()
