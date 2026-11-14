@@ -1,0 +1,7 @@
+{
+  "judge_model": "auto/glm-5.3-flash",
+  "judge_effort": "high",
+  "max_dispatch": 4,
+  "app_model_ids": [],
+  "app_model_order": []
+}
